@@ -47,6 +47,196 @@ class SiTSchedulerOutput(BaseOutput):
     pred_original_sample: Optional[torch.FloatTensor] = None
 
 
+def expand_t_like_x(t, x):
+    """Function to reshape time t to broadcastable dimension of x
+    Args:
+      t: [batch_dim,], time vector
+      x: [batch_dim,...], data point
+    """
+    dims = [1] * (len(x.size()) - 1)
+    t = t.view(t.size(0), *dims)
+    return t
+
+
+#################### Coupling Plans ####################
+
+class ICPlan:
+    """Linear Coupling Plan"""
+    def __init__(self, sigma=0.0):
+        self.sigma = sigma
+
+    def compute_alpha_t(self, t):
+        """Compute the data coefficient along the path"""
+        return t, 1
+    
+    def compute_sigma_t(self, t):
+        """Compute the noise coefficient along the path"""
+        return 1 - t, -1
+    
+    def compute_d_alpha_alpha_ratio_t(self, t):
+        """Compute the ratio between d_alpha and alpha"""
+        return 1 / t
+
+    def compute_drift(self, x, t):
+        """We always output sde according to score parametrization; """
+        t = expand_t_like_x(t, x)
+        alpha_ratio = self.compute_d_alpha_alpha_ratio_t(t)
+        sigma_t, d_sigma_t = self.compute_sigma_t(t)
+        drift = alpha_ratio * x
+        diffusion = alpha_ratio * (sigma_t ** 2) - sigma_t * d_sigma_t
+
+        return -drift, diffusion
+
+    def compute_diffusion(self, x, t, form="constant", norm=1.0):
+        """Compute the diffusion term of the SDE
+        Args:
+          x: [batch_dim, ...], data point
+          t: [batch_dim,], time vector
+          form: str, form of the diffusion term
+          norm: float, norm of the diffusion term
+        """
+        t = expand_t_like_x(t, x)
+        choices = {
+            "constant": norm,
+            "SBDM": norm * self.compute_drift(x, t)[1],
+            "sigma": norm * self.compute_sigma_t(t)[0],
+            "linear": norm * (1 - t),
+            "decreasing": 0.25 * (norm * torch.cos(np.pi * t) + 1) ** 2,
+            "inccreasing-decreasing": norm * torch.sin(np.pi * t) ** 2,
+        }
+
+        try:
+            diffusion = choices[form]
+        except KeyError:
+            raise NotImplementedError(f"Diffusion form {form} not implemented")
+        
+        return diffusion
+
+    def get_score_from_velocity(self, velocity, x, t):
+        """Wrapper function: transfrom velocity prediction model to score
+        Args:
+            velocity: [batch_dim, ...] shaped tensor; velocity model output
+            x: [batch_dim, ...] shaped tensor; x_t data point
+            t: [batch_dim,] time tensor
+        """
+        t = expand_t_like_x(t, x)
+        alpha_t, d_alpha_t = self.compute_alpha_t(t)
+        sigma_t, d_sigma_t = self.compute_sigma_t(t)
+        mean = x
+        reverse_alpha_ratio = alpha_t / d_alpha_t
+        var = sigma_t**2 - reverse_alpha_ratio * d_sigma_t * sigma_t
+        score = (reverse_alpha_ratio * velocity - mean) / var
+        return score
+    
+    def get_noise_from_velocity(self, velocity, x, t):
+        """Wrapper function: transfrom velocity prediction model to denoiser
+        Args:
+            velocity: [batch_dim, ...] shaped tensor; velocity model output
+            x: [batch_dim, ...] shaped tensor; x_t data point
+            t: [batch_dim,] time tensor
+        """
+        t = expand_t_like_x(t, x)
+        alpha_t, d_alpha_t = self.compute_alpha_t(t)
+        sigma_t, d_sigma_t = self.compute_sigma_t(t)
+        mean = x
+        reverse_alpha_ratio = alpha_t / d_alpha_t
+        var = reverse_alpha_ratio * d_sigma_t - sigma_t
+        noise = (reverse_alpha_ratio * velocity - mean) / var
+        return noise
+
+    def get_velocity_from_score(self, score, x, t):
+        """Wrapper function: transfrom score prediction model to velocity
+        Args:
+            score: [batch_dim, ...] shaped tensor; score model output
+            x: [batch_dim, ...] shaped tensor; x_t data point
+            t: [batch_dim,] time tensor
+        """
+        t = expand_t_like_x(t, x)
+        drift, var = self.compute_drift(x, t)
+        velocity = var * score - drift
+        return velocity
+
+    def compute_mu_t(self, t, x0, x1):
+        """Compute the mean of time-dependent density p_t"""
+        t = expand_t_like_x(t, x1)
+        alpha_t, _ = self.compute_alpha_t(t)
+        sigma_t, _ = self.compute_sigma_t(t)
+        return alpha_t * x1 + sigma_t * x0
+    
+    def compute_xt(self, t, x0, x1):
+        """Sample xt from time-dependent density p_t; rng is required"""
+        xt = self.compute_mu_t(t, x0, x1)
+        return xt
+    
+    def compute_ut(self, t, x0, x1, xt):
+        """Compute the vector field corresponding to p_t"""
+        t = expand_t_like_x(t, x1)
+        _, d_alpha_t = self.compute_alpha_t(t)
+        _, d_sigma_t = self.compute_sigma_t(t)
+        return d_alpha_t * x1 + d_sigma_t * x0
+    
+    def plan(self, t, x0, x1):
+        xt = self.compute_xt(t, x0, x1)
+        ut = self.compute_ut(t, x0, x1, xt)
+        return t, xt, ut
+    
+
+class VPCPlan(ICPlan):
+    """class for VP path flow matching"""
+
+    def __init__(self, sigma_min=0.1, sigma_max=20.0):
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.log_mean_coeff = lambda t: -0.25 * ((1 - t) ** 2) * (self.sigma_max - self.sigma_min) - 0.5 * (1 - t) * self.sigma_min 
+        self.d_log_mean_coeff = lambda t: 0.5 * (1 - t) * (self.sigma_max - self.sigma_min) + 0.5 * self.sigma_min
+
+
+    def compute_alpha_t(self, t):
+        """Compute coefficient of x1"""
+        alpha_t = self.log_mean_coeff(t)
+        alpha_t = torch.exp(alpha_t)
+        d_alpha_t = alpha_t * self.d_log_mean_coeff(t)
+        return alpha_t, d_alpha_t
+    
+    def compute_sigma_t(self, t):
+        """Compute coefficient of x0"""
+        p_sigma_t = 2 * self.log_mean_coeff(t)
+        sigma_t = torch.sqrt(1 - torch.exp(p_sigma_t))
+        d_sigma_t = torch.exp(p_sigma_t) * (2 * self.d_log_mean_coeff(t)) / (-2 * sigma_t)
+        return sigma_t, d_sigma_t
+    
+    def compute_d_alpha_alpha_ratio_t(self, t):
+        """Special purposed function for computing numerical stabled d_alpha_t / alpha_t"""
+        return self.d_log_mean_coeff(t)
+
+    def compute_drift(self, x, t):
+        """Compute the drift term of the SDE"""
+        t = expand_t_like_x(t, x)
+        beta_t = self.sigma_min + (1 - t) * (self.sigma_max - self.sigma_min)
+        return -0.5 * beta_t * x, beta_t / 2
+    
+
+class GVPCPlan(ICPlan):
+    def __init__(self, sigma=0.0):
+        super().__init__(sigma)
+    
+    def compute_alpha_t(self, t):
+        """Compute coefficient of x1"""
+        alpha_t = torch.sin(t * np.pi / 2)
+        d_alpha_t = np.pi / 2 * torch.cos(t * np.pi / 2)
+        return alpha_t, d_alpha_t
+    
+    def compute_sigma_t(self, t):
+        """Compute coefficient of x0"""
+        sigma_t = torch.cos(t * np.pi / 2)
+        d_sigma_t = -np.pi / 2 * torch.sin(t * np.pi / 2)
+        return sigma_t, d_sigma_t
+    
+    def compute_d_alpha_alpha_ratio_t(self, t):
+        """Special purposed function for computing numerical stabled d_alpha_t / alpha_t"""
+        return np.pi / (2 * torch.tan(t * np.pi / 2))
+
+
 def betas_for_alpha_bar(
     num_diffusion_timesteps,
     max_beta=0.999,
@@ -127,6 +317,238 @@ def rescale_zero_terminal_snr(betas):
 
     return betas
 
+class Sampler:
+    """Sampler class for the transport model"""
+    def __init__(
+        self,
+        transport,
+    ):
+        """Constructor for a general sampler; supporting different sampling methods
+        Args:
+        - transport: an tranport object specify model prediction & interpolant type
+        """
+        
+        self.transport = transport
+        self.drift = self.transport.get_drift()
+        self.score = self.transport.get_score()
+    
+    def __get_sde_diffusion_and_drift(
+        self,
+        *,
+        diffusion_form="SBDM",
+        diffusion_norm=1.0,
+    ):
+
+        def diffusion_fn(x, t):
+            diffusion = self.transport.path_sampler.compute_diffusion(x, t, form=diffusion_form, norm=diffusion_norm)
+            return diffusion
+        
+        sde_drift = \
+            lambda x, t, model, **kwargs: \
+                self.drift(x, t, model, **kwargs) + diffusion_fn(x, t) * self.score(x, t, model, **kwargs)
+    
+        sde_diffusion = diffusion_fn
+
+        return sde_drift, sde_diffusion
+    
+    def __get_last_step(
+        self,
+        sde_drift,
+        *,
+        last_step,
+        last_step_size,
+    ):
+        """Get the last step function of the SDE solver"""
+    
+        if last_step is None:
+            last_step_fn = \
+                lambda x, t, model, **model_kwargs: \
+                    x
+        elif last_step == "Mean":
+            last_step_fn = \
+                lambda x, t, model, **model_kwargs: \
+                    x + sde_drift(x, t, model, **model_kwargs) * last_step_size
+        elif last_step == "Tweedie":
+            alpha = self.transport.path_sampler.compute_alpha_t # simple aliasing; the original name was too long
+            sigma = self.transport.path_sampler.compute_sigma_t
+            last_step_fn = \
+                lambda x, t, model, **model_kwargs: \
+                    x / alpha(t)[0][0] + (sigma(t)[0][0] ** 2) / alpha(t)[0][0] * self.score(x, t, model, **model_kwargs)
+        elif last_step == "Euler":
+            last_step_fn = \
+                lambda x, t, model, **model_kwargs: \
+                    x + self.drift(x, t, model, **model_kwargs) * last_step_size
+        else:
+            raise NotImplementedError()
+
+        return last_step_fn
+
+    def sample_sde(
+        self,
+        *,
+        sampling_method="Euler",
+        diffusion_form="SBDM",
+        diffusion_norm=1.0,
+        last_step="Mean",
+        last_step_size=0.04,
+        num_steps=250,
+    ):
+        """returns a sampling function with given SDE settings
+        Args:
+        - sampling_method: type of sampler used in solving the SDE; default to be Euler-Maruyama
+        - diffusion_form: function form of diffusion coefficient; default to be matching SBDM
+        - diffusion_norm: function magnitude of diffusion coefficient; default to 1
+        - last_step: type of the last step; default to identity
+        - last_step_size: size of the last step; default to match the stride of 250 steps over [0,1]
+        - num_steps: total integration step of SDE
+        """
+
+        if last_step is None:
+            last_step_size = 0.0
+
+        sde_drift, sde_diffusion = self.__get_sde_diffusion_and_drift(
+            diffusion_form=diffusion_form,
+            diffusion_norm=diffusion_norm,
+        )
+
+        t0, t1 = self.transport.check_interval(
+            self.transport.train_eps,
+            self.transport.sample_eps,
+            diffusion_form=diffusion_form,
+            sde=True,
+            eval=True,
+            reverse=False,
+            last_step_size=last_step_size,
+        )
+
+        _sde = sde(
+            sde_drift,
+            sde_diffusion,
+            t0=t0,
+            t1=t1,
+            num_steps=num_steps,
+            sampler_type=sampling_method
+        )
+
+        last_step_fn = self.__get_last_step(sde_drift, last_step=last_step, last_step_size=last_step_size)
+            
+
+        def _sample(init, model, **model_kwargs):
+            xs = _sde.sample(init, model, **model_kwargs)
+            ts = th.ones(init.size(0), device=init.device) * t1
+            x = last_step_fn(xs[-1], ts, model, **model_kwargs)
+            xs.append(x)
+
+            assert len(xs) == num_steps, "Samples does not match the number of steps"
+
+            return xs
+
+        return _sample
+    
+    def sample_ode(
+        self,
+        *,
+        sampling_method="dopri5",
+        num_steps=50,
+        atol=1e-6,
+        rtol=1e-3,
+        reverse=False,
+    ):
+        """returns a sampling function with given ODE settings
+        Args:
+        - sampling_method: type of sampler used in solving the ODE; default to be Dopri5
+        - num_steps: 
+            - fixed solver (Euler, Heun): the actual number of integration steps performed
+            - adaptive solver (Dopri5): the number of datapoints saved during integration; produced by interpolation
+        - atol: absolute error tolerance for the solver
+        - rtol: relative error tolerance for the solver
+        - reverse: whether solving the ODE in reverse (data to noise); default to False
+        """
+        if reverse:
+            drift = lambda x, t, model, **kwargs: self.drift(x, th.ones_like(t) * (1 - t), model, **kwargs)
+        else:
+            drift = self.drift
+
+        t0, t1 = self.transport.check_interval(
+            self.transport.train_eps,
+            self.transport.sample_eps,
+            sde=False,
+            eval=True,
+            reverse=reverse,
+            last_step_size=0.0,
+        )
+
+        _ode = ode(
+            drift=drift,
+            t0=t0,
+            t1=t1,
+            sampler_type=sampling_method,
+            num_steps=num_steps,
+            atol=atol,
+            rtol=rtol,
+        )
+        
+        return _ode.sample
+
+    def sample_ode_likelihood(
+        self,
+        *,
+        sampling_method="dopri5",
+        num_steps=50,
+        atol=1e-6,
+        rtol=1e-3,
+    ):
+        
+        """returns a sampling function for calculating likelihood with given ODE settings
+        Args:
+        - sampling_method: type of sampler used in solving the ODE; default to be Dopri5
+        - num_steps: 
+            - fixed solver (Euler, Heun): the actual number of integration steps performed
+            - adaptive solver (Dopri5): the number of datapoints saved during integration; produced by interpolation
+        - atol: absolute error tolerance for the solver
+        - rtol: relative error tolerance for the solver
+        """
+        def _likelihood_drift(x, t, model, **model_kwargs):
+            x, _ = x
+            eps = th.randint(2, x.size(), dtype=th.float, device=x.device) * 2 - 1
+            t = th.ones_like(t) * (1 - t)
+            with th.enable_grad():
+                x.requires_grad = True
+                grad = th.autograd.grad(th.sum(self.drift(x, t, model, **model_kwargs) * eps), x)[0]
+                logp_grad = th.sum(grad * eps, dim=tuple(range(1, len(x.size()))))
+                drift = self.drift(x, t, model, **model_kwargs)
+            return (-drift, logp_grad)
+        
+        t0, t1 = self.transport.check_interval(
+            self.transport.train_eps,
+            self.transport.sample_eps,
+            sde=False,
+            eval=True,
+            reverse=False,
+            last_step_size=0.0,
+        )
+
+        _ode = ode(
+            drift=_likelihood_drift,
+            t0=t0,
+            t1=t1,
+            sampler_type=sampling_method,
+            num_steps=num_steps,
+            atol=atol,
+            rtol=rtol,
+        )
+
+        def _sample_fn(x, model, **model_kwargs):
+            init_logp = th.zeros(x.size(0)).to(x)
+            input = (x, init_logp)
+            drift, delta_logp = _ode.sample(input, model, **model_kwargs)
+            drift, delta_logp = drift[-1], delta_logp[-1]
+            prior_logp = self.transport.prior_logp(drift)
+            logp = prior_logp - delta_logp
+            return logp, drift
+
+        return _sample_fn
+
 
 class SiTScheduler(SchedulerMixin, ConfigMixin):
     """
@@ -197,6 +619,8 @@ class SiTScheduler(SchedulerMixin, ConfigMixin):
         timestep_spacing: str = "leading",
         steps_offset: int = 0,
         rescale_betas_zero_snr: int = False,
+        path_type: str = "gvp", # One of ["linear", "vp", "gvp"]
+        solver_type: str = "ode", # One of ["ode", "sde"]. ODE refers to using velocity, and SDE refers to using scores for inference
     ):
         if trained_betas is not None:
             self.betas = torch.tensor(trained_betas, dtype=torch.float32)
@@ -232,6 +656,24 @@ class SiTScheduler(SchedulerMixin, ConfigMixin):
         self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy())
 
         self.variance_type = variance_type
+        
+        #! Stochastic Interpolant specifics (Possible refactor needed)       
+        if path_type == "linear": # Only supports Flow-based Model (pred type: velocity)
+            if self.config.prediction_type != "v-prediction":
+                raise ValueError(f"Linear planning does not take model prediction type of {self.config.prediction_type}.")
+            self.coupling_plan = ICPlan()
+        elif path_type == "vp": # Only supports DDPMs (pred type: epsilon)
+            if self.config.prediction_type != "epsilon":
+                raise ValueError(f"VP planning does not take model prediction type of {self.config.prediction_type}.")
+            self.coupling_plan = VPCPlan()
+        elif path_type == "gvp": # Only supports V-prediction Model (pred type: velocity)
+            if self.config.prediction_type != "v-prediction":
+                raise ValueError(f"GVP planning does not take model prediction type of {self.config.prediction_type}.")
+            self.coupling_plan = GVPCPlan()        
+        else :
+            raise NotImplementedError()
+        
+        self.solver_type = solver_type # "ode" vs "sde", where ODE uses velocity, and SDE uses score
 
     def scale_model_input(self, sample: torch.FloatTensor, timestep: Optional[int] = None) -> torch.FloatTensor:
         """
@@ -405,7 +847,7 @@ class SiTScheduler(SchedulerMixin, ConfigMixin):
         sample: torch.FloatTensor,
         generator=None,
         return_dict: bool = True,
-    ) -> Union[DDPMSchedulerOutput, Tuple]:
+    ) -> Union[SiTSchedulerOutput, Tuple]:
         """
         Predict the sample from the previous timestep by reversing the SDE. This function propagates the diffusion
         process from the learned model outputs (most often the predicted noise).
@@ -414,7 +856,7 @@ class SiTScheduler(SchedulerMixin, ConfigMixin):
             model_output (`torch.FloatTensor`):
                 The direct output from learned diffusion model.
             timestep (`float`):
-                The current discrete timestep in the diffusion chain.
+                The current discrete3 timestep in the diffusion chain.
             sample (`torch.FloatTensor`):
                 A current instance of a sample created by the diffusion process.
             generator (`torch.Generator`, *optional*):
@@ -436,6 +878,42 @@ class SiTScheduler(SchedulerMixin, ConfigMixin):
             model_output, predicted_variance = torch.split(model_output, sample.shape[1], dim=1)
         else:
             predicted_variance = None
+
+        #! Branch out whether the sampler is ODE or SDE here. Might need refactoring here.
+
+        dt = prev_t - t
+
+        if self.solver_type == "ode":
+            if self.config.prediction_type == "epsilon":
+                sigma_t = self.coupling_plan.compute_sigma_t(t)
+                score = model_output / -sigma_t
+                velocity = self.coupling_plan.get_velocity_from_score(score)
+            else:
+                velocity = model_output
+
+            # pred_prev_sample = ode_solver(sample, dt, velocity)            
+            pred_prev_sample = sample + velocity * dt
+            
+        elif self.solver_type == "sde":
+            if self.config.prediction_type == "velocity":
+                score = self.coupling_plan.get_score_from_velocity(score)
+            elif self.config.prediction_type == "epsilon":
+                sigma_t = self.coupling_plan.compute_sigma_t(t)
+                score = model_output / -sigma_t
+            else:
+                raise ValueError()
+            drift = self.coupling_plan.compute_drift(score, t)
+            diffusion = self.coupling_plan.compute_diffusion()
+            sde_drift = drift + diffusion * score
+            sde_diffusion = diffusion
+            
+            pred_prev_sample = sde_drift * dt + sde_diffusion * torch.sqrt(dt)
+            
+        else:
+            raise ValueError()
+
+        if self.config.prediction_type == "epsilon":
+
 
         # 1. compute alphas, betas
         alpha_prod_t = self.alphas_cumprod[t]
