@@ -120,12 +120,8 @@ class ICPlan:
             t: [batch_dim,] time tensor
         """
         t = expand_t_like_x(t, x)
-        alpha_t, d_alpha_t = self.compute_alpha_t(t)
-        sigma_t, d_sigma_t = self.compute_sigma_t(t)
-        mean = x
-        reverse_alpha_ratio = alpha_t / d_alpha_t
-        var = sigma_t**2 - reverse_alpha_ratio * d_sigma_t * sigma_t
-        score = (reverse_alpha_ratio * velocity - mean) / var
+        drift, var = self.compute_drift(x, t)
+        score = (velocity - drift) / var
         return score
     
     def get_noise_from_velocity(self, velocity, x, t):
@@ -135,13 +131,9 @@ class ICPlan:
             x: [batch_dim, ...] shaped tensor; x_t data point
             t: [batch_dim,] time tensor
         """
-        t = expand_t_like_x(t, x)
-        alpha_t, d_alpha_t = self.compute_alpha_t(t)
-        sigma_t, d_sigma_t = self.compute_sigma_t(t)
-        mean = x
-        reverse_alpha_ratio = alpha_t / d_alpha_t
-        var = reverse_alpha_ratio * d_sigma_t - sigma_t
-        noise = (reverse_alpha_ratio * velocity - mean) / var
+        score = self.get_score_from_velocity(velocity, x, t)
+        sigma_t = self.compute_sigma_t(t)
+        noise = -sigma_t * score
         return noise
 
     def get_velocity_from_score(self, score, x, t):
@@ -153,7 +145,7 @@ class ICPlan:
         """
         t = expand_t_like_x(t, x)
         drift, var = self.compute_drift(x, t)
-        velocity = var * score - drift
+        velocity = var * score + drift
         return velocity
 
     def compute_mu_t(self, t, x0, x1):
@@ -191,14 +183,14 @@ class VPCPlan(ICPlan):
         self.d_log_mean_coeff = lambda t: 0.5 * (1 - t) * (self.sigma_max - self.sigma_min) + 0.5 * self.sigma_min
 
 
-    def compute_alpha_t(self, t):
+    def compute_sigma_t(self, t):
         """Compute coefficient of x1"""
         alpha_t = self.log_mean_coeff(t)
         alpha_t = torch.exp(alpha_t)
         d_alpha_t = alpha_t * self.d_log_mean_coeff(t)
         return alpha_t, d_alpha_t
     
-    def compute_sigma_t(self, t):
+    def compute_alpha_t(self, t):
         """Compute coefficient of x0"""
         p_sigma_t = 2 * self.log_mean_coeff(t)
         sigma_t = torch.sqrt(1 - torch.exp(p_sigma_t))
@@ -220,14 +212,14 @@ class GVPCPlan(ICPlan):
     def __init__(self, sigma=0.0):
         super().__init__(sigma)
     
-    def compute_alpha_t(self, t):
-        """Compute coefficient of x1"""
+    def compute_sigma_t(self, t):
+        """Compute coefficient of x0"""
         alpha_t = torch.sin(t * np.pi / 2)
         d_alpha_t = np.pi / 2 * torch.cos(t * np.pi / 2)
         return alpha_t, d_alpha_t
     
-    def compute_sigma_t(self, t):
-        """Compute coefficient of x0"""
+    def compute_alpha_t(self, t):
+        """Compute coefficient of x1"""
         sigma_t = torch.cos(t * np.pi / 2)
         d_sigma_t = -np.pi / 2 * torch.sin(t * np.pi / 2)
         return sigma_t, d_sigma_t
