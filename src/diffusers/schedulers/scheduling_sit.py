@@ -67,15 +67,15 @@ class ICPlan:
 
     def compute_alpha_t(self, t):
         """Compute the data coefficient along the path"""
-        return t, 1
+        return 1 - t, -1
     
     def compute_sigma_t(self, t):
         """Compute the noise coefficient along the path"""
-        return 1 - t, -1
+        return t, 1
     
     def compute_d_alpha_alpha_ratio_t(self, t):
         """Compute the ratio between d_alpha and alpha"""
-        return 1 / t
+        return 1 / (t - 1) 
 
     def compute_drift(self, x, t):
         """We always output sde according to score parametrization; """
@@ -85,7 +85,7 @@ class ICPlan:
         drift = alpha_ratio * x
         diffusion = alpha_ratio * (sigma_t ** 2) - sigma_t * d_sigma_t
 
-        return -drift, diffusion
+        return drift, diffusion
 
     def compute_diffusion(self, x, t, form="constant", norm=1.0):
         """Compute the diffusion term of the SDE
@@ -236,6 +236,191 @@ class GVPCPlan(ICPlan):
         """Special purposed function for computing numerical stabled d_alpha_t / alpha_t"""
         return np.pi / (2 * torch.tan(t * np.pi / 2))
 
+def expand_t_like_x(t, x):
+    """Function to reshape time t to broadcastable dimension of x
+    Args:
+      t: [batch_dim,], time vector
+      x: [batch_dim,...], data point
+    """
+    dims = [1] * (len(x.size()) - 1)
+    t = t.view(t.size(0), *dims)
+    return t
+
+class Transport(object):
+    def __init__(self, path_sampler:ICPlan, model_type="velocity") -> None:
+        self.path_sampler = path_sampler
+        self.model_type = model_type
+
+    def get_drift(
+        self
+    ):
+        """member function for obtaining the drift of the probability flow ODE"""
+        def score_ode(x, t, model, **model_kwargs):
+            drift_mean, drift_var = self.path_sampler.compute_drift(x, t)
+            model_output = model(x, t, **model_kwargs)
+            return (drift_mean + drift_var * model_output) # by change of variable
+        
+        def noise_ode(x, t, model, **model_kwargs):
+            drift_mean, drift_var = self.path_sampler.compute_drift(x, t)
+            sigma_t, _ = self.path_sampler.compute_sigma_t(expand_t_like_x(t, x))
+            model_output = model(x, t, **model_kwargs)
+            score = model_output / -sigma_t
+            return (drift_mean + drift_var * score)
+        
+        def velocity_ode(x, t, model, **model_kwargs):
+            model_output = model(x, t, **model_kwargs)
+            return model_output
+
+        if self.model_type == "noise":
+            drift_fn = noise_ode
+        elif self.model_type == "score":
+            drift_fn = score_ode
+        else:
+            drift_fn = velocity_ode
+        
+        def body_fn(x, t, model, **model_kwargs):
+            model_output = drift_fn(x, t, model, **model_kwargs)
+            assert model_output.shape == x.shape, "Output shape from ODE solver must match input shape"
+            return model_output
+
+        return body_fn
+    
+
+    def get_score(
+        self,
+    ):
+        """member function for obtaining score of 
+            x_t = alpha_t * x + sigma_t * eps"""
+        if self.model_type == "noise":
+            score_fn = lambda x, t, model, **kwargs: model(x, t, **kwargs) / -self.path_sampler.compute_sigma_t(expand_t_like_x(t, x))[0]
+        elif self.model_type == "score":
+            score_fn = lambda x, t, model, **kwagrs: model(x, t, **kwagrs)
+        elif self.model_type == "velocity":
+            score_fn = lambda x, t, model, **kwargs: self.path_sampler.get_score_from_velocity(model(x, t, **kwargs), x, t)
+        else:
+            raise NotImplementedError()
+        
+        return score_fn
+
+class Sampler:
+    """Sampler class for the transport model"""
+    def __init__(
+        self,
+        transport,
+    ):
+        """Constructor for a general sampler; supporting different sampling methods
+        Args:
+        - transport: an tranport object specify model prediction & interpolant type
+        """
+        
+        self.transport = transport
+        self.drift = self.transport.get_drift()
+        self.score = self.transport.get_score()
+    
+    def __get_sde_diffusion_and_drift(
+        self,
+        *,
+        diffusion_form="SBDM",
+        diffusion_norm=1.0,
+    ):
+
+        def diffusion_fn(x, t):
+            diffusion = self.transport.path_sampler.compute_diffusion(x, t, form=diffusion_form, norm=diffusion_norm)
+            return diffusion
+        
+        sde_drift = \
+            lambda x, t, model, **kwargs: \
+                self.drift(x, t, model, **kwargs) + diffusion_fn(x, t) * self.score(x, t, model, **kwargs)
+    
+        sde_diffusion = diffusion_fn
+
+        return sde_drift, sde_diffusion
+    
+    def __get_last_step(
+        self,
+        sde_drift,
+        *,
+        last_step,
+        last_step_size,
+    ):
+        """Get the last step function of the SDE solver"""
+    
+        if last_step is None:
+            last_step_fn = \
+                lambda x, t, model, **model_kwargs: \
+                    x
+        elif last_step == "Mean":
+            last_step_fn = \
+                lambda x, t, model, **model_kwargs: \
+                    x + sde_drift(x, t, model, **model_kwargs) * last_step_size
+        elif last_step == "Tweedie":
+            alpha = self.transport.path_sampler.compute_alpha_t # simple aliasing; the original name was too long
+            sigma = self.transport.path_sampler.compute_sigma_t
+            last_step_fn = \
+                lambda x, t, model, **model_kwargs: \
+                    x / alpha(t)[0][0] + (sigma(t)[0][0] ** 2) / alpha(t)[0][0] * self.score(x, t, model, **model_kwargs)
+        elif last_step == "Euler":
+            last_step_fn = \
+                lambda x, t, model, **model_kwargs: \
+                    x + self.drift(x, t, model, **model_kwargs) * last_step_size
+        else:
+            raise NotImplementedError()
+
+        return last_step_fn
+
+    def sample_sde(
+        self,
+        *,
+        diffusion_form="SBDM",
+        diffusion_norm=1.0,
+        last_step="Mean",
+    ):
+        """returns a sampling function with given SDE settings
+        Args:
+        - sampling_method: type of sampler used in solving the SDE; default to be Euler-Maruyama
+        - diffusion_form: function form of diffusion coefficient; default to be matching SBDM
+        - diffusion_norm: function magnitude of diffusion coefficient; default to 1
+        - last_step: type of the last step; default to identity
+        - last_step_size: size of the last step; default to match the stride of 250 steps over [0,1]
+        - num_steps: total integration step of SDE
+        """
+
+        if last_step is None:
+            last_step_size = 0.0
+
+        sde_drift, sde_diffusion = self.__get_sde_diffusion_and_drift(
+            diffusion_form=diffusion_form,
+            diffusion_norm=diffusion_norm,
+        )
+
+        return sde_drift, sde_diffusion
+
+    
+    def sample_ode(
+        self,
+        *,
+        sampling_method="dopri5",
+        num_steps=50,
+        atol=1e-6,
+        rtol=1e-3,
+        reverse=False,
+    ):
+        """returns a sampling function with given ODE settings
+        Args:
+        - sampling_method: type of sampler used in solving the ODE; default to be Dopri5
+        - num_steps: 
+            - fixed solver (Euler, Heun): the actual number of integration steps performed
+            - adaptive solver (Dopri5): the number of datapoints saved during integration; produced by interpolation
+        - atol: absolute error tolerance for the solver
+        - rtol: relative error tolerance for the solver
+        - reverse: whether solving the ODE in reverse (data to noise); default to False
+        """
+        if reverse:
+            drift = lambda x, t, model, **kwargs: self.drift(x, th.ones_like(t) * (1 - t), model, **kwargs)
+        else:
+            drift = self.drift
+
+        return drift
 
 def betas_for_alpha_bar(
     num_diffusion_timesteps,
