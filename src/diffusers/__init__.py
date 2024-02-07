@@ -159,6 +159,7 @@ else:
             "UnCLIPScheduler",
             "UniPCMultistepScheduler",
             "VQDiffusionScheduler",
+            "SiTScheduler",
         ]
     )
     _import_structure["training_utils"] = ["EMAModel"]
@@ -535,6 +536,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             SASolverScheduler,
             SchedulerMixin,
             ScoreSdeVeScheduler,
+            SiTScheduler,
             UnCLIPScheduler,
             UniPCMultistepScheduler,
             VQDiffusionScheduler,

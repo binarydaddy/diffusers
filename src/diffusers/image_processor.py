@@ -87,6 +87,7 @@ class VaeImageProcessor(ConfigMixin):
         """
         if images.ndim == 3:
             images = images[None, ...]
+
         images = (images * 255).round().astype("uint8")
         if images.shape[-1] == 1:
             # special case for grayscale (single channel) images

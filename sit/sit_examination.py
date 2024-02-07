@@ -6,60 +6,18 @@
 # coco2017 captions have 5 caption per sample.
 import torch
 import diffusers
-from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler, HeunDiscreteScheduler
+from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler, HeunDiscreteScheduler, SiTScheduler, DDIMScheduler
 import enum
 
-class A(enum.Enum):
+model_id = "stabilityai/stable-diffusion-2"
+
+# Use the Euler scheduler here instead
+scheduler = SiTScheduler.from_pretrained(model_id, subfolder="scheduler", solver_type="ode", path_type="gvp")
+pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
+# pipe = StableDiffusionPipeline.from_pretrained(model_id, scheduler=scheduler, torch_dtype=torch.float16)
+pipe = pipe.to("cuda")
+
+prompt = "a photo of an astronaut riding a horse on mars"
+image = pipe(prompt, num_inference_steps=250).images[0]
     
-
-# def extract_captions_from_coco():
-#     '''
-#         coco2017 validation set has 5 captions per validation sample.
-#         There are total of 5000 images, and thus 25000 captions.
-#         Saved under "sit/coco2017_val_captions.txt"
-#     '''
-#     import json
-#     import os
-    
-#     val_anno_path = "/data2/coco2017/annotations/captions_val2017.json"
-
-#     with open(val_anno_path, 'r')as f:
-#         val_anno = json.load(f)
-
-#     full_captions = []
-
-#     for annotation in val_anno['annotations']:
-#         caption = annotation['caption']
-#         full_captions.append(caption)
-
-#     if not os.path.exists('coco2017_val_captions.txt'):
-#         with open('coco2017_val_captions.txt', 'w') as f:
-#             for cap in full_captions:
-#                 context = '\n' + cap
-#                 f.writelines(context)
-#         print(f"Done writing")
-
-# def val_coco_sit(nfe=1000):
-    
-#     # Initialize StableDiffusion2 model
-#     # stable-diffusion-2-base (512-base-ema.ckpt) is trained with score objective
-#     # stable-diffusion-2 (768-v-ema.ckpt) is trained with v-prediction objective
-#     base_model_id = "stabilityai/stable-diffusion-2-base"
-#     v_model_id = "stabilityai/stable-diffusion-2"
-
-#     base_model = StableDiffusionPipeline.from_pretrained(base_model_id)
-#     v_model = StableDiffusionPipeline.from_pretrained(v_model_id)
-
-#     scheduler = SiTScheduler().from_pretrained()
-
-#     # base model is solved through sde, and v model is solved through ode
-    
-
-    
-#     return
-
-
-# if __name__ == "__main__":
-#     # extract_captions_from_coco()
-
-#     val_coco_sit()
+image.save("astronaut_rides_horse_ddim.png")
