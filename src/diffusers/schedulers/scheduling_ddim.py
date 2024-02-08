@@ -222,6 +222,20 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
 
+        #! swhong
+        sit_spacing = torch.linspace(0, 1, num_train_timesteps, dtype=torch.float32)
+        sit_alphas = torch.cos(np.pi/2 * sit_spacing)
+        sit_sigmas = torch.sin(np.pi/2 * sit_spacing)
+
+        torch.set_printoptions(sci_mode=False)
+        print(f"{sit_alphas[:10] = }")
+        print(f"{self.alphas_cumprod[-10:]}")
+
+        sit_alphas_cumprod_ts = torch.arccos(self.alphas_cumprod) / np.pi * 2
+        print(f"{sit_alphas_cumprod_ts}")
+        exit()
+        #! swhong end
+
         # At every step in ddim, we are looking into the previous alphas_cumprod
         # For the final step, there is no previous alphas_cumprod because we are already at 0
         # `set_alpha_to_one` decides whether we set this parameter simply to one or
@@ -418,8 +432,16 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
             pred_original_sample = model_output
             pred_epsilon = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
         elif self.config.prediction_type == "v_prediction":
-            pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
-            pred_epsilon = (alpha_prod_t**0.5) * model_output + (beta_prod_t**0.5) * sample
+
+            #! swhong
+            ts_scale = timestep / self.num_inference_steps
+            alpha_t = torch.cos(np.pi/2 * ts_scale)
+            sigma_t = torch.sin(np.pi/2 * ts_scale)
+            pred_original_sample = alpha_t * sample - sigma_t * model_output
+            pred_epsilon = alpha_t * model_output + sigma_t * sample
+            # pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
+            # pred_epsilon = (alpha_prod_t**0.5) * model_output + (beta_prod_t**0.5) * sample
+            #! swhong end
         else:
             raise ValueError(
                 f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`, or"

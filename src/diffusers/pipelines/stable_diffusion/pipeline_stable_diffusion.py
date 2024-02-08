@@ -1019,7 +1019,23 @@ class StableDiffusionPipeline(
                     noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale)
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                # latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                    
+                #! swhong
+                ddim_output = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=True)
+                latents = ddim_output.prev_sample
+                latents_proj = ddim_output.pred_original_sample
+
+                if i % 10 == 9:
+                    print(f"Saving original image")
+                    proj_image = self.vae.decode(latents_proj / self.vae.config.scaling_factor, return_dict=False, generator=generator)[0]
+                    proj_image, has_nsfw_concept = self.run_safety_checker(proj_image, device, prompt_embeds.dtype)
+                    do_denormalize = [True] * proj_image.shape[0]
+                    proj_image = self.image_processor.postprocess(proj_image, output_type=output_type, do_denormalize=do_denormalize)
+                    proj_image = proj_image[0]
+                    proj_image.save(f'test_out/ddim_intermediate_projection_step_{int(t)}.png')
+                    
+
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

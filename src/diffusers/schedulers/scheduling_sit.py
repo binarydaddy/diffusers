@@ -100,9 +100,9 @@ class ICPlan:
             "constant": norm,
             "SBDM": norm * self.compute_drift(x, t)[1],
             "sigma": norm * self.compute_sigma_t(t)[0],
-            "linear": norm * (1 - t),
-            "decreasing": 0.25 * (norm * torch.cos(np.pi * t) + 1) ** 2,
-            "inccreasing-decreasing": norm * torch.sin(np.pi * t) ** 2,
+            "linear": norm * t,
+            "decreasing": norm * torch.sin(np.pi * 0.5 * t),
+            "increasing-decreasing": norm * torch.sin(np.pi * t) ** 2,
         }
 
         try:
@@ -119,11 +119,17 @@ class ICPlan:
             x: [batch_dim, ...] shaped tensor; x_t data point
             t: [batch_dim,] time tensor
         """
-        t = expand_t_like_x(t, x) # (1,1,1,1)
-        drift, var = self.compute_drift(x, t)
-        score = (velocity - drift) / var
-        return score
     
+        t = expand_t_like_x(t, x)
+        alpha_t, d_alpha_t = self.compute_alpha_t(t)
+        sigma_t, d_sigma_t = self.compute_sigma_t(t)
+
+        numerator = alpha_t * velocity - d_alpha_t * x
+        denominator = alpha_t * sigma_t * d_sigma_t - d_alpha_t * sigma_t ** 2
+        score = numerator / denominator
+
+        return score
+
     def get_noise_from_velocity(self, velocity, x, t):
         """Wrapper function: transfrom velocity prediction model to denoiser
         Args:
@@ -173,41 +179,6 @@ class ICPlan:
         return t, xt, ut
     
 
-class VPCPlan(ICPlan):
-    """class for VP path flow matching"""
-
-    def __init__(self, sigma_min=0.1, sigma_max=20.0):
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
-        self.log_mean_coeff = lambda t: -0.25 * ((1 - t) ** 2) * (self.sigma_max - self.sigma_min) - 0.5 * (1 - t) * self.sigma_min 
-        self.d_log_mean_coeff = lambda t: 0.5 * (1 - t) * (self.sigma_max - self.sigma_min) + 0.5 * self.sigma_min
-
-
-    def compute_sigma_t(self, t):
-        """Compute coefficient of x1"""
-        alpha_t = self.log_mean_coeff(t)
-        alpha_t = torch.exp(alpha_t)
-        d_alpha_t = alpha_t * self.d_log_mean_coeff(t)
-        return alpha_t, d_alpha_t
-    
-    def compute_alpha_t(self, t):
-        """Compute coefficient of x0"""
-        p_sigma_t = 2 * self.log_mean_coeff(t)
-        sigma_t = torch.sqrt(1 - torch.exp(p_sigma_t))
-        d_sigma_t = torch.exp(p_sigma_t) * (2 * self.d_log_mean_coeff(t)) / (-2 * sigma_t)
-        return sigma_t, d_sigma_t
-    
-    def compute_d_alpha_alpha_ratio_t(self, t):
-        """Special purposed function for computing numerical stabled d_alpha_t / alpha_t"""
-        return self.d_log_mean_coeff(t)
-
-    def compute_drift(self, x, t):
-        """Compute the drift term of the SDE"""
-        t = expand_t_like_x(t, x)
-        beta_t = self.sigma_min + (1 - t) * (self.sigma_max - self.sigma_min)
-        return -0.5 * beta_t * x, beta_t / 2
-    
-
 class GVPCPlan(ICPlan):
     def __init__(self, sigma=0.0):
         super().__init__(sigma)
@@ -226,106 +197,7 @@ class GVPCPlan(ICPlan):
     
     def compute_d_alpha_alpha_ratio_t(self, t):
         """Special purposed function for computing numerical stabled d_alpha_t / alpha_t"""
-        return -np.pi / 2 * torch.tan(t * np.pi / 2)
-
-def expand_t_like_x(t, x):
-    """Function to reshape time t to broadcastable dimension of x
-    Args:
-      t: [batch_dim,], time vector
-      x: [batch_dim,...], data point
-    """
-    dims = [1] * (len(x.size()) - 1)
-    t = t.view(t.size(0), *dims)
-    return t
-
-class Transport(object):
-    def __init__(self, path_sampler="gvp", model_type="velocity") -> None:
-        
-        if path_sampler == "gvp":
-            self.path_sampler = GVPCPlan()
-        elif path_sampler == "vp":
-            self.path_sampler = VPCPlan()
-        elif path_sampler == "linear":
-            self.path_sampler = ICPlan()
-        else:
-            raise ValueError()
-        
-        self.model_type = model_type
-
-        self.drift = self.__get_drift()
-        self.score = self.__get_score()
-
-    def __get_drift(
-        self
-    ):
-        """member function for obtaining the drift of the probability flow ODE"""
-        def score_ode(x, t, model, **model_kwargs):
-            drift_mean, drift_var = self.path_sampler.compute_drift(x, t)
-            model_output = model(x, t, **model_kwargs)
-            return (drift_mean + drift_var * model_output) # by change of variable
-        
-        def noise_ode(x, t, model, **model_kwargs):
-            drift_mean, drift_var = self.path_sampler.compute_drift(x, t)
-            sigma_t, _ = self.path_sampler.compute_sigma_t(expand_t_like_x(t, x))
-            model_output = model(x, t, **model_kwargs)
-            score = model_output / -sigma_t
-            return (drift_mean + drift_var * score)
-        
-        def velocity_ode(x, t, model, **model_kwargs):
-            model_output = model(x, t, **model_kwargs)
-            return model_output
-
-        if self.model_type == "noise":
-            drift_fn = noise_ode
-        elif self.model_type == "score":
-            drift_fn = score_ode
-        else:
-            drift_fn = velocity_ode
-        
-        def body_fn(x, t, model, **model_kwargs):
-            model_output = drift_fn(x, t, model, **model_kwargs)
-            assert model_output.shape == x.shape, "Output shape from ODE solver must match input shape"
-            return model_output
-
-        return body_fn
-    
-
-    def __get_score(
-        self,
-    ):
-        """member function for obtaining score of 
-            x_t = alpha_t * x + sigma_t * eps"""
-        if self.model_type == "noise":
-            score_fn = lambda x, t, model, **kwargs: model(x, t, **kwargs) / -self.path_sampler.compute_sigma_t(expand_t_like_x(t, x))[0]
-        elif self.model_type == "score":
-            score_fn = lambda x, t, model, **kwagrs: model(x, t, **kwagrs)
-        elif self.model_type == "velocity":
-            score_fn = lambda x, t, model, **kwargs: self.path_sampler.get_score_from_velocity(model(x, t, **kwargs), x, t)
-        else:
-            raise NotImplementedError()
-        
-        return score_fn
-    
-    def get_rsde_drift_and_diffusion(self, diffusion_form="SBDM", diffusion_norm=1.0):
-        """
-            Returns functions that generate drift and diffusion coefficients for reverse sde.
-
-            drift : (x, t, model) -> drift coeff
-
-            diffusion : (x, t) -> diffusion-coeff
-
-        """
-        def diffusion_fn(x, t):
-            diffusion = self.path_sampler.compute_diffusion(x, t, form=diffusion_form, norm=diffusion_norm)
-            return diffusion
-        
-        sde_drift = \
-            lambda x, t, model, **kwargs: \
-                self.drift(x, t, model, **kwargs) + diffusion_fn(x, t) * self.score(x, t, model, **kwargs)
-    
-        sde_diffusion = diffusion_fn
-
-        return sde_drift, sde_diffusion
+        return -np.pi / (2 * torch.tan(t * np.pi / 2))    
 
 def betas_for_alpha_bar(
     num_diffusion_timesteps,
@@ -478,6 +350,7 @@ class SiTScheduler(SchedulerMixin, ConfigMixin):
         rescale_betas_zero_snr: int = False,
         path_type: str = "gvp", # One of ["linear", "vp", "gvp"]
         solver_type: str = "ode", # One of ["ode", "sde"]. ODE refers to using velocity, and SDE refers to using scores for inference
+        diffusion_form: str = "constant",
     ):
         if trained_betas is not None:
             self.betas = torch.tensor(trained_betas, dtype=torch.float32)
@@ -519,10 +392,6 @@ class SiTScheduler(SchedulerMixin, ConfigMixin):
             if self.config.prediction_type != "v_prediction":
                 raise ValueError(f"Linear planning does not take model prediction type of {self.config.prediction_type}.")
             self.coupling_plan = ICPlan()
-        elif path_type == "vp": # Only supports DDPMs (pred type: epsilon)
-            if self.config.prediction_type != "epsilon":
-                raise ValueError(f"VP planning does not take model prediction type of {self.config.prediction_type}.")
-            self.coupling_plan = VPCPlan()
         elif path_type == "gvp": # Only supports V-prediction Model (pred type: velocity)
             if self.config.prediction_type != "v_prediction":
                 raise ValueError(f"GVP planning does not take model prediction type of {self.config.prediction_type}.")
@@ -531,6 +400,7 @@ class SiTScheduler(SchedulerMixin, ConfigMixin):
             raise NotImplementedError()
         
         self.solver_type = solver_type # "ode" vs "sde", where ODE uses velocity, and SDE uses score
+        self.diffusion_form = diffusion_form
 
     def scale_model_input(self, sample: torch.FloatTensor, timestep: Optional[int] = None) -> torch.FloatTensor:
         """
@@ -767,19 +637,19 @@ class SiTScheduler(SchedulerMixin, ConfigMixin):
 
             # drift, diffusion = self.coupling_plan.compute_drift(sample, t_scale)
             
-            rsde_diffusion = self.coupling_plan.compute_diffusion(sample, t_scale, form="sigma")
+            rsde_diffusion = self.coupling_plan.compute_diffusion(sample, t_scale, form=self.diffusion_form, norm=0.8)
+            # rsde_diffusion = torch.tensor([0.7], dtype=sample.dtype).to(sample.device)
 
             rsde_drift = velocity + 0.5 * rsde_diffusion * score # reverse_sde calculation
 
             if prev_t <= 0: # if last step, remove diffusion
-                rsde_diffusion = 0
+                rsde_diffusion = torch.tensor([0.0], dtype=sample.dtype).to(sample.device)
+                dt_scale = self.scale_timestep(-t) # last step size
 
-            pred_prev_sample = sample + (rsde_drift * dt_scale + rsde_diffusion * torch.sqrt(-dt_scale) * torch.randn_like(rsde_drift))
-
-            if DEBUG and torch.sum(pred_prev_sample.isnan()) > 0 :
-                print(f"{t = }")
-                print(f"{t_scale = }")
-                exit()
+            # Euler-Maruyama method
+            # pred_prev_sample = sample + (rsde_drift * dt_scale + torch.sqrt(rsde_diffusion) * torch.sqrt(-dt_scale) * torch.randn_like(rsde_drift))
+            pred_prev_sample = sample + (rsde_drift * dt_scale + rsde_diffusion * torch.sqrt(-dt_scale) * torch.randn(rsde_drift.size()).to(rsde_drift))
+            # pred_prev_sample = sample + (rsde_drift * dt_scale)
 
         else:
             raise ValueError()
